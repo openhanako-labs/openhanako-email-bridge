@@ -2,11 +2,17 @@
 
 Hanako 邮件监听与自动回复服务。通过 ClawEmail WebSocket Push 实时接收新邮件，存档并发送自动确认回复。事件驱动，无需轮询。
 码放这儿了，自取：
+
 CLAW2860DD50A3D6
+
 CLAW3CD4B6A418A5
+
 CLAWB852ED898A5D
+
 CLAW53BFB78087F2
-CLAW2DA5FC020035
+
+CLAW2DA5FC020035（已用）
+
 已用的请说一声
 
 ## 架构
