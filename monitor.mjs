@@ -73,6 +73,16 @@ function saveProcessedSet(set) {
   fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...set]));
 }
 
+// ── 验证码提取 ────────────────────────────────────────
+function extractCode(text) {
+  // 优先匹配「验证码(是|为|：|:)」后面的数字串
+  const nearMatch = text.match(/验证码[是为：:]\s*(\d{4,8})/);
+  if (nearMatch) return nearMatch[1];
+  // 其次匹配任何独立的 4-8 位数字（前后非数字）
+  const anyMatch = text.match(/(?<!\d)(\d{4,8})(?!\d)/);
+  return anyMatch ? anyMatch[1] : null;
+}
+
 // ── 桌面通知 ───────────────────────────────────────────
 function desktopNotify(title, body) {
   try {
@@ -111,10 +121,14 @@ async function processNewEmail(client, mailId) {
     }
 
     // 3. 跳过系统通知（noreply、verify 等）
+    //    白名单：标题含"验证码"/"verification code"的邮件放行，不跳过
     const fromStr = fromArr.join(" ");
     const subjectStr = email.subject || "";
-    if (/noreply@|no-reply@|notifications@/i.test(fromStr) ||
-        /verify your email|please verify/i.test(subjectStr)) {
+    const textContent = email.text?.content || email.html?.content || "";
+    const isCodeWhitelist = /验证码|verification code|verify code/i.test(subjectStr);
+    if (!isCodeWhitelist && (
+        /noreply@|no-reply@|notifications@/i.test(fromStr) ||
+        /verify your email|please verify/i.test(subjectStr))) {
       log("INFO", "跳过系统通知邮件");
       processed.add(mailId); saveProcessedSet(processed);
       return;
@@ -127,7 +141,7 @@ async function processNewEmail(client, mailId) {
     fs.writeFileSync(path.join(emailDir, "email.json"), JSON.stringify({
       mailId, from: email.from, to: email.to,
       subject: email.subject, date: email.date,
-      textContent: email.text?.content || "",
+      textContent,
       hasHtml: !!email.html?.content,
       attachments: email.attachments?.map(a => ({
         id: a.id, filename: a.filename, contentType: a.contentType, size: a.size
@@ -149,7 +163,6 @@ async function processNewEmail(client, mailId) {
 
     // 6. 写入待处理队列（等 hanako 来取）
     const pendingFile = path.join(PENDING_DIR, `${safeId}.json`);
-    const textContent = email.text?.content || email.html?.content || "";
     fs.writeFileSync(pendingFile, JSON.stringify({
       mailId, safeId,
       from: fromStr,
@@ -190,11 +203,21 @@ async function processNewEmail(client, mailId) {
     try { fs.unlinkSync(pendingFile); } catch {}
     log("INFO", "邮件处理完成", { mailId });
 
-    // 9. 桌面通知
-    desktopNotify(
-      `📬 ${fromStr.split("<")[0].trim() || "新邮件"}`,
-      `${email.subject || "(无主题)"}`
-    );
+    // 9. 桌面通知（按邮件类型显示不同内容）
+    const senderName = fromStr.split("<")[0].trim() || "新邮件";
+    let notifyBody;
+    if (isCodeWhitelist && textContent) {
+      const code = extractCode(textContent);
+      notifyBody = code
+        ? `验证码：${code}`
+        : `📧 ${email.subject || "(无主题)"}`;
+    } else if (textContent) {
+      const preview = textContent.replace(/\s+/g, " ").trim().slice(0, 80);
+      notifyBody = `${email.subject || "(无主题)"}\n${preview}`;
+    } else {
+      notifyBody = `${email.subject || "(无主题)"}`;
+    }
+    desktopNotify(senderName, notifyBody);
 
   } catch (e) {
     log("ERROR", "处理邮件失败", { mailId, err: e.message, stack: e.stack?.slice(0, 200) });
