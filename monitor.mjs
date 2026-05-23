@@ -1,11 +1,15 @@
 /**
  * hanako 邮件监听服务
  * 
- * 通过 ClawEmail WebSocket Push 实时接收新邮件通知，
- * 保存邮件内容到本地存档，立即处理并发送自动回复。
- * 事件驱动，无需 cron 轮询。
+ * 通过 ClawEmail WebSocket Push 实时接收新邮件通知（支持多账号），
+ * 保存邮件内容到本地存档。事件驱动，无需 cron 轮询。
  * 
  * 运行方式：pm2 start monitor.mjs --name "email-monitor"
+ * 
+ * 多账号配置方式（.env）：
+ *   CLAWEMAIL_API_KEY=...          # 共享 API Key
+ *   CLAWEMAIL_ADDRESS=...          # 主账号
+ *   CLAWEMAIL_EXTRA_ADDRESSES=...  # 额外账号，逗号分隔
  */
 
 import { MailClient } from "@clawemail/node-sdk";
@@ -39,10 +43,26 @@ function requireEnv(name) {
   return val;
 }
 
+const API_KEY = requireEnv("CLAWEMAIL_API_KEY");
+const PRIMARY_EMAIL = requireEnv("CLAWEMAIL_ADDRESS");
+const EXTRA_EMAILS = (process.env.CLAWEMAIL_EXTRA_ADDRESSES || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// 构建账号列表，每个账号有 id 和 email
+const ACCOUNTS = [
+  { id: "default", email: PRIMARY_EMAIL },
+  ...EXTRA_EMAILS.map(email => {
+    // 从邮箱前缀提取 id（如 kimilophelia.roxy → roxy）
+    const prefix = email.split("@")[0];
+    const id = prefix.includes(".") ? prefix.split(".").pop() : prefix;
+    return { id, email };
+  }),
+];
+
 const CONFIG = {
-  apiKey: requireEnv("CLAWEMAIL_API_KEY"),
-  email: requireEnv("CLAWEMAIL_ADDRESS"),
-  user: requireEnv("CLAWEMAIL_ADDRESS"),
+  apiKey: API_KEY,
   homeEmail: process.env.CLAWEMAIL_HOME_EMAIL || "",
   logDir: path.join(__dirname, "logs"),
   dataDir: path.join(__dirname, "data"),
@@ -96,7 +116,7 @@ function desktopNotify(title, body) {
 }
 
 // ── 邮件处理 ────────────────────────────────────────────
-async function processNewEmail(client, mailId) {
+async function processNewEmail(client, mailId, accountEmail) {
   log("INFO", "收到新邮件通知", { mailId });
 
   // 去重
@@ -114,8 +134,8 @@ async function processNewEmail(client, mailId) {
 
     // 2. 跳过自己发出的邮件
     const fromArr = Array.isArray(email.from) ? email.from : [email.from || ""];
-    if (fromArr.some(f => f.includes(CONFIG.email))) {
-      log("INFO", "跳过自己发出的邮件");
+    if (fromArr.some(f => f.includes(accountEmail))) {
+      log("INFO", "跳过自己发出的邮件", { accountEmail });
       processed.add(mailId); saveProcessedSet(processed);
       return;
     }
@@ -223,42 +243,58 @@ async function scanExistingUnread(client) {
   }
 }
 
+// ── 启动单个账号的监听 ─────────────────────────────
+async function startAccount(account) {
+  log("INFO", `[${account.id}] 正在连接 ${account.email} ...`);
+
+  const client = new MailClient({
+    user: account.email, apiKey: CONFIG.apiKey,
+    logger: {
+      info: (msg, data) => log("WS", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+      warn: (msg, data) => log("WS_WARN", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+      error: (msg, data) => log("WS_ERROR", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+    },
+  });
+
+  await client.getAccessToken();
+  log("INFO", `[${account.id}] MailClient 验证通过`);
+
+  client.ws.onMessage(async (notification) => {
+    if (notification?.mailId) await processNewEmail(client, notification.mailId, account.email);
+  });
+  client.ws.onDisconnect((reason) => log("WARN", `[${account.id}] WebSocket 断开`, { reason }));
+
+  await client.ws.connect();
+  log("INFO", `[${account.id}] ✅ WebSocket 推送已连接`);
+
+  await scanExistingUnread(client);
+
+  return client;
+}
+
 // ── 主函数 ──────────────────────────────────────────────
 async function main() {
   log("INFO", "=".repeat(50));
-  log("INFO", "hanako 邮件监听服务启动", { email: CONFIG.email });
+  log("INFO", `hanako 邮件监听服务启动`);
+  log("INFO", `账号数: ${ACCOUNTS.length}`, { accounts: ACCOUNTS.map(a => a.id) });
 
-  let client;
+  const clients = [];
+
   try {
-    client = new MailClient({
-      user: CONFIG.user, apiKey: CONFIG.apiKey,
-      logger: {
-        info: (msg, data) => log("WS", msg, data && typeof data === "object" ? data : { msg: data }),
-        warn: (msg, data) => log("WS_WARN", msg, data && typeof data === "object" ? data : { msg: data }),
-        error: (msg, data) => log("WS_ERROR", msg, data && typeof data === "object" ? data : { msg: data }),
-      },
-    });
+    for (const account of ACCOUNTS) {
+      const client = await startAccount(account);
+      clients.push(client);
+    }
 
-    await client.getAccessToken();
-    log("INFO", "MailClient 验证通过");
-
-    client.ws.onMessage(async (notification) => {
-      if (notification?.mailId) await processNewEmail(client, notification.mailId);
-    });
-    client.ws.onDisconnect((reason) => log("WARN", "WebSocket 断开", { reason }));
-
-    await client.ws.connect();
-    log("INFO", "✅ WebSocket 推送已连接");
-
-    await scanExistingUnread(client);
-
-    process.on("SIGINT", gracefulShutdown);
-    process.on("SIGTERM", gracefulShutdown);
+    process.on("SIGINT", () => gracefulShutdown(clients));
+    process.on("SIGTERM", () => gracefulShutdown(clients));
     process.on("uncaughtException", (e) => log("ERROR", "未捕获异常", { err: e.message }));
 
-    async function gracefulShutdown() {
+    async function gracefulShutdown(allClients) {
       log("INFO", "正在停止服务...");
-      try { client.ws.disconnect(); } catch {}
+      for (const c of allClients) {
+        try { c.ws.disconnect(); } catch {}
+      }
       log("INFO", "服务已停止");
       process.exit(0);
     }
