@@ -35,7 +35,15 @@ export CLAWEMAIL_ADDRESS=your_email@example.com
 export CLAWEMAIL_HOME_EMAIL=admin@example.com   # 可选
 
 # 启动
-pm2 start monitor.mjs --name "email-monitor"
+pm2 start ecosystem.config.cjs
+
+# 安装日志轮转（防止日志文件无限增长）
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 50M
+pm2 set pm2-logrotate:retain 5
+
+# 持久化（开机自启）
+pm2 save
 
 # 查看状态
 pm2 status
