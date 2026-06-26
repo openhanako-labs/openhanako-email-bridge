@@ -19,6 +19,7 @@ module.exports = {
     max_memory_restart: "200M",
     env: {
       NODE_ENV: "production",
+      PATH: "C:\\Users\\Administrator\\AppData\\Roaming\\npm;" + process.env.PATH,
     },
   }],
 };

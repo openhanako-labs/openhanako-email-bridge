@@ -10,7 +10,23 @@
  * 前置条件：agently-cli auth login 已完成 OAuth 授权
  */
 
-import { execFileSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
+
+// AgentQQ CLI 绝对路径（Windows npm global）
+const AGENTQQ_CLI_PATH = "C:\\Users\\Administrator\\AppData\\Roaming\\npm\\agently-cli.cmd";
+
+// 执行 CLI 命令（Windows 兼容 .cmd 文件）
+function runCli(args, timeout = 15000) {
+  // Windows .cmd 文件需要用 cmd.exe /c 调用
+  const cmdArgs = ["/c", AGENTQQ_CLI_PATH, ...args];
+  const result = spawnSync("cmd.exe", cmdArgs, {
+    encoding: "utf-8",
+    timeout,
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  return result.stdout || result.stderr || "";
+}
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
@@ -18,65 +34,65 @@ import fs from "node:fs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── 配置 ────────────────────────────────────────────────
-const POLL_INTERVAL_SEC = parseInt(process.env.AGENTQQ_POLL_INTERVAL_SEC || "60", 10);
-const AGENTQQ_ADDRESSES = (process.env.AGENTQQ_EXTRA_ADDRESSES || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+function getPollInterval() {
+  return parseInt(process.env.AGENTQQ_POLL_INTERVAL_SEC || "60", 10);
+}
+function getAgentQQExtraAddresses() {
+  return (process.env.AGENTQQ_EXTRA_ADDRESSES || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+}
 
-// AgentQQ 地址列表（+me 返回的主地址 + 额外地址）
+// AgentQQ 地址列表（优先使用 .env 配置，fallback 到 +me 检测）
 function getAgentQQAddresses() {
-  const addresses = [];
-  try {
-    // 通过 "+me" 获取主邮箱地址
-    const result = execFileSync("agently-cli", ["+me"], { encoding: "utf-8", timeout: 15000 });
-    const match = result.match(/邮箱地址\s+(\S+)\s+已授权/);
-    if (match) {
-      addresses.push(match[1]);
-    }
-  } catch (e) {
-    console.warn("[AGENTQQ] 获取主邮箱失败:", e.message.slice(0, 100));
-  }
-
-  // 追加额外地址
-  for (const addr of AGENTQQ_ADDRESSES) {
-    if (!addresses.includes(addr)) {
-      addresses.push(addr);
+  const AGENTQQ_ADDRESSES = getAgentQQExtraAddresses();
+  const addresses = [...AGENTQQ_ADDRESSES.filter(a => a.trim())];
+  
+  // 如果 .env 没配地址，尝试通过 +me 自动检测
+  if (addresses.length === 0) {
+    try {
+      const result = runCli(["+me"], 15000);
+      const data = extractJson(result);
+      if (data && data.data && data.data.aliases) {
+        const primary = data.data.aliases.find(a => a.is_primary);
+        if (primary && primary.email && !addresses.includes(primary.email)) {
+          addresses.push(primary.email);
+        }
+      }
+    } catch (e) {
+      console.warn("[AGENTQQ] +me 检测失败:", e.message.slice(0, 100));
     }
   }
 
   return addresses;
 }
 
-// ── 解析 CLI 邮件列表输出 ───────────────────────────────
-function parseMessageList(output) {
-  const messages = [];
-  const lines = output.trim().split("\n");
-
+// ── 提取 JSON 输出（过滤 tip: 等非 JSON 行） ───────────
+function extractJson(output) {
+  const lines = output.split("\n");
   for (const line of lines) {
-    // 格式：{"id":"msg_xxx","from":"xxx","to":"xxx","subject":"xxx","date":"xxx",...}
-    const jsonMatch = line.match(/^\{.*\}$/);
-    if (jsonMatch) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
       try {
-        const msg = JSON.parse(jsonMatch[0]);
-        if (msg.id) {
-          messages.push(msg);
-        }
+        return JSON.parse(trimmed);
       } catch {}
     }
   }
+  return null;
+}
 
-  return messages;
+// ── 解析 CLI 邮件列表输出 ───────────────────────────────
+function parseMessageList(output) {
+  const data = extractJson(output);
+  if (!data || !data.data) return [];
+  return data.data.filter(m => m.id);
 }
 
 // ── 调用 CLI 拉取邮件 ───────────────────────────────────
 function fetchMessages(address, limit = 10) {
   try {
-    const result = execFileSync(
-      "agently-cli",
-      ["message", "+list", "--limit", String(limit)],
-      { encoding: "utf-8", timeout: 30000 }
-    );
+    const result = runCli(["message", "+list", "--limit", String(limit)], 30000);
     return parseMessageList(result);
   } catch (e) {
     console.warn(`[AGENTQQ] 拉取邮件失败 (${address}):`, e.message.slice(0, 100));
@@ -87,11 +103,7 @@ function fetchMessages(address, limit = 10) {
 // ── 调用 CLI 读取邮件详情 ───────────────────────────────
 function readMessage(msgId) {
   try {
-    const result = execFileSync(
-      "agently-cli",
-      ["message", "+read", "--id", msgId],
-      { encoding: "utf-8", timeout: 30000 }
-    );
+    const result = runCli(["message", "+read", "--id", msgId], 30000);
     // CLI 输出可能是 JSON 或格式化文本，尝试解析
     try {
       return JSON.parse(result);
@@ -108,11 +120,7 @@ function readMessage(msgId) {
 // ── 下载附件 ────────────────────────────────────────────
 function downloadAttachment(msgId, attId, outputDir) {
   try {
-    execFileSync(
-      "agently-cli",
-      ["attachment", "+download", "--msg", msgId, "--att", attId, "--output", outputDir],
-      { encoding: "utf-8", timeout: 60000 }
-    );
+    runCli(["attachment", "+download", "--msg", msgId, "--att", attId, "--output", outputDir], 60000);
     return true;
   } catch (e) {
     console.warn(`[AGENTQQ] 附件下载失败 (${msgId}/${attId}):`, e.message.slice(0, 100));
@@ -178,7 +186,7 @@ async function pollLoop(processCallback, identityMap) {
     }
 
     // 等待下一个轮询周期
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_SEC * 1000));
+    await new Promise(resolve => setTimeout(resolve, getPollInterval() * 1000));
   }
 }
 
