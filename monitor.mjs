@@ -315,7 +315,7 @@ async function handleEmailProcess(email, mailId, accountEmail, accountId) {
     fs.writeFileSync(pendingFile, JSON.stringify({
       mailId, safeId,
       from: fromStr, subject: email.subject, date: email.date,
-      textContent, scrubbedText,
+      textContent, scrubbedText: scrubText,
       textPreview: effectiveText.slice(0, 200),
       identity, identityRules: rules, isExternal,
       replyDecision: rules.shouldAutoReply ? "auto" : (rules.requireReply ? "manual" : "none"),
