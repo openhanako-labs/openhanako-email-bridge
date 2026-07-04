@@ -56,9 +56,6 @@ loadEnv();
 
 // ── 后端选择 ────────────────────────────────────────────
 
-/**
- * 根据邮箱地址选 backend
- */
 function selectBackend(email) {
   if (!email) throw new Error("selectBackend: email is required");
   const lower = email.toLowerCase();
@@ -67,9 +64,6 @@ function selectBackend(email) {
   throw new Error(`selectBackend: unknown domain for ${email}`);
 }
 
-/**
- * 解析 account 配置（从 .env 映射中找 API Key）
- */
 function resolveAccountConfig(email) {
   const apiKey = process.env.CLAWEMAIL_API_KEY;
   if (!apiKey) {
@@ -81,8 +75,6 @@ function resolveAccountConfig(email) {
     apiKey,
   };
 }
-
-// ── 账号配置缓存 ────────────────────────────────────────
 
 const accountCache = new Map();
 
@@ -97,21 +89,14 @@ function getAccount(email) {
 
 const awareness = buildFromEnv();
 
-/**
- * 判断发件人是否需要确认
- * @param {object} email - 邮件对象 { from: "Name <addr@x.com>" }
- * @returns {boolean} true = 需要确认
- */
 function needsConfirmation(email) {
   const from = Array.isArray(email.from) ? email.from.join(" ") : (email.from || "");
   const fromStr = from.toLowerCase();
   
-  // 内部联系人白名单
   for (const contact of awareness.internalContacts) {
     if (fromStr.includes(contact.toLowerCase())) return false;
   }
   
-  // 自己发的邮件（多个 account 互相发）
   const ownEmails = [
     process.env.CLAWEMAIL_ADDRESS,
     ...(process.env.CLAWEMAIL_EXTRA_ADDRESSES || "").split(",").map(s => s.trim()),
@@ -125,7 +110,7 @@ function needsConfirmation(email) {
   return true;
 }
 
-// ── 待发送队列（外部邮件确认用） ───────────────────────
+// ── 待发送队列 ──────────────────────────────────────────
 
 function queuePendingSend(account, operation, targetEmail, payload) {
   fs.mkdirSync(PENDING_SEND_DIR, { recursive: true });
@@ -134,7 +119,7 @@ function queuePendingSend(account, operation, targetEmail, payload) {
   const entry = {
     id,
     account,
-    operation, // "send" | "reply" | "forward"
+    operation,
     targetEmail,
     payload,
     createdAt: new Date().toISOString(),
@@ -146,9 +131,6 @@ function queuePendingSend(account, operation, targetEmail, payload) {
 
 // ── 统一 API ───────────────────────────────────────────
 
-/**
- * 列出邮件
- */
 export async function listMessages(accountEmail, options = {}) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -157,9 +139,6 @@ export async function listMessages(accountEmail, options = {}) {
   return await agentqq.listMessages(options);
 }
 
-/**
- * 搜索邮件
- */
 export async function searchMessages(accountEmail, keyword, options = {}) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -168,9 +147,6 @@ export async function searchMessages(accountEmail, keyword, options = {}) {
   return await agentqq.searchMessages(keyword, options);
 }
 
-/**
- * 读取邮件
- */
 export async function readMessage(accountEmail, messageId, options = {}) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -179,9 +155,6 @@ export async function readMessage(accountEmail, messageId, options = {}) {
   return await agentqq.readMessage(messageId);
 }
 
-/**
- * 下载附件
- */
 export async function downloadAttachment(accountEmail, messageId, partId, outputDir) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -190,18 +163,9 @@ export async function downloadAttachment(accountEmail, messageId, partId, output
   return await agentqq.downloadAttachment(messageId, partId, outputDir);
 }
 
-/**
- * 发送邮件
- * @param {string} accountEmail - 发件账号
- * @param {object} options - { to, cc, bcc, subject, body, ... }
- * @param {object} context - { originalEmail } 外部邮件发送时需传入原文用于白名单判断
- * @returns {object} { sent: true, result } 或 { queued: true, queueId }
- */
 export async function sendMail(accountEmail, options, context = {}) {
   const config = getAccount(accountEmail);
   
-  // 白名单判断：只在回复/转发场景需要外部邮件判断
-  // 主动发送不经过白名单（用户明确意图）
   if (context.originalEmail && needsConfirmation(context.originalEmail)) {
     const queueEntry = queuePendingSend(accountEmail, "send", options.to, options);
     return { queued: true, queueId: queueEntry.id, reason: "external_recipient" };
@@ -216,17 +180,9 @@ export async function sendMail(accountEmail, options, context = {}) {
   return { sent: true, result };
 }
 
-/**
- * 回复邮件
- * @param {string} accountEmail
- * @param {string} messageId
- * @param {object} options - { body, replyAll, ... }
- * @returns {object} { sent, result } 或 { queued, queueId }
- */
 export async function reply(accountEmail, messageId, options = {}) {
   const config = getAccount(accountEmail);
   
-  // 先读取原邮件判断白名单
   let originalEmail;
   try {
     originalEmail = await readMessage(accountEmail, messageId);
@@ -234,13 +190,11 @@ export async function reply(accountEmail, messageId, options = {}) {
     throw new Error(`reply: failed to read original email: ${e.message}`);
   }
   
-  // 外部邮件 → 队列
   if (needsConfirmation(originalEmail)) {
     const queueEntry = queuePendingSend(accountEmail, "reply", messageId, options);
     return { queued: true, queueId: queueEntry.id, reason: "external_sender", originalEmail };
   }
   
-  // 内部邮件 → 直接发
   let result;
   if (config.backend === "clawemail") {
     result = await clawemail.replyToMail(config.apiKey, accountEmail, messageId, options);
@@ -250,13 +204,9 @@ export async function reply(accountEmail, messageId, options = {}) {
   return { sent: true, result };
 }
 
-/**
- * 转发邮件
- */
 export async function forward(accountEmail, messageId, options = {}) {
   const config = getAccount(accountEmail);
   
-  // 转发需要先读原邮件判断
   let originalEmail;
   try {
     originalEmail = await readMessage(accountEmail, messageId);
@@ -271,7 +221,6 @@ export async function forward(accountEmail, messageId, options = {}) {
   
   let result;
   if (config.backend === "clawemail") {
-    // ClawEmail SDK 没有 forward，回退到 send + 引用原邮件
     throw new Error("forward: ClawEmail backend does not support forward. Use reply or send instead.");
   } else {
     result = await agentqq.forwardMail(messageId, options);
@@ -279,9 +228,6 @@ export async function forward(accountEmail, messageId, options = {}) {
   return { sent: true, result };
 }
 
-/**
- * 移动邮件
- */
 export async function moveMessage(accountEmail, messageId, targetFid) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -290,9 +236,6 @@ export async function moveMessage(accountEmail, messageId, targetFid) {
   throw new Error("moveMessage: AgentQQ backend move not implemented (CLI limitation)");
 }
 
-/**
- * 标记已读/未读
- */
 export async function markRead(accountEmail, messageId, read = true) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -301,9 +244,6 @@ export async function markRead(accountEmail, messageId, read = true) {
   return await agentqq.markRead(messageId, read);
 }
 
-/**
- * 列出文件夹
- */
 export async function listFolders(accountEmail) {
   const config = getAccount(accountEmail);
   if (config.backend === "clawemail") {
@@ -353,17 +293,19 @@ const COMMANDS = {
 function parseOptions(args) {
   const opts = {};
   for (const arg of args) {
-    const eqIdx = arg.indexOf("=");
+    // Strip leading dashes (--key=value → key=value)
+    const clean = arg.replace(/^-+/, '');
+    const eqIdx = clean.indexOf('=');
     if (eqIdx > 0) {
-      const key = arg.slice(0, eqIdx);
-      const val = arg.slice(eqIdx + 1);
+      const key = clean.slice(0, eqIdx);
+      const val = clean.slice(eqIdx + 1);
       opts[key] = val;
     }
   }
   return opts;
 }
 
-// Detect CLI mode: if this script is run directly (not imported)
+// Detect CLI mode
 const isCliMode = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
 if (isCliMode) {

@@ -357,15 +357,60 @@ async function handleEmailProcess(email, mailId, accountEmail, accountId) {
   try { saveProcessedSet(accountId, getProcessedSet(accountId)); } catch {}
 }
 
-// ── 启动时扫描已有未读邮件 ──────────────────────
+// ── 启动时扫描已有未读邮件（增量 + 容错） ────────────
+
+// 持久化上次扫描时间戳，避免重复处理
+function getLastScanTime(accountId) {
+  try {
+    const f = path.join(CONFIG.dataDir, `_last_scan_${accountId}.json`);
+    const data = JSON.parse(fs.readFileSync(f, "utf-8"));
+    return data.timestamp ? new Date(data.timestamp) : null;
+  } catch { return null; }
+}
+
+function saveLastScanTime(accountId, timestamp) {
+  try {
+    const f = path.join(CONFIG.dataDir, `_last_scan_${accountId}.json`);
+    fs.writeFileSync(f, JSON.stringify({ timestamp: new Date(timestamp).toISOString() }));
+  } catch {}
+}
+
 async function scanExistingUnread(client) {
   try {
     log("INFO", "扫描已有未读邮件...");
-    const unread = await client.transport.listMessages({ fid: 1, unread: true, limit: 50 });
-    if (unread.length === 0) { log("INFO", "没有未读邮件"); return; }
-    log("INFO", "发现未读邮件", { count: unread.length });
-    for (const msg of unread) {
-      await processNewEmail(client, msg.id, client.user, client.accountId);
+
+    // 用上次扫描时间做增量，避免全量拉取
+    const lastScan = getLastScanTime(client.accountId);
+    const since = lastScan ? lastScan.toISOString().replace(/\.\d{3}Z$/, "Z") : undefined;
+
+    // 先查收件箱，再查垃圾邮件夹（最多 2 个文件夹）
+    const foldersToScan = [1];
+    if (!lastScan) foldersToScan.push(5); // 首次启动也扫垃圾邮件夹
+
+    let totalFound = 0;
+    for (const fid of foldersToScan) {
+      try {
+        const queryParams = { fid, unread: true, limit: 50 };
+        if (since) queryParams.since = since;
+        const unread = await client.transport.listMessages(queryParams);
+        if (unread.length === 0) continue;
+        log("INFO", `在文件夹 ${fid} 发现未读邮件`, { count: unread.length });
+        for (const msg of unread) {
+          await processNewEmail(client, msg.id, client.user, client.accountId);
+          totalFound++;
+        }
+      } catch (e) {
+        log("WARN", `文件夹 ${fid} 扫描失败`, { err: e.message });
+      }
+    }
+
+    // 更新扫描时间
+    saveLastScanTime(client.accountId, new Date());
+
+    if (totalFound === 0 && !lastScan) {
+      log("INFO", "没有未读邮件（首次扫描）");
+    } else if (totalFound === 0) {
+      log("INFO", "没有新的未读邮件");
     }
   } catch (e) {
     log("WARN", "扫描未读邮件失败", { err: e.message });

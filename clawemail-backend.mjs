@@ -1,27 +1,20 @@
 /**
  * ClawEmail 后端 — 封装 @clawemail/node-sdk + mail-cli
  *
- * SDK 提供：读、写、回复、附件下载、WebSocket 推送
- * mail-cli 提供：列表、搜索、移动、标记（CLI 不返回正文）
+ * SDK 提供：读、写、回复、附件下载、WebSocket 推送、列表/搜索
+ * mail-cli 提供：移动、标记（SDK 无对应 API）
  *
- * 不提供：转发（SDK 没有 forward 命令，CLI 也没有）
+ * 列表/搜索已迁移至 SDK transport（mail-cli 的 --fid 参数有 bug）
  */
 
 import { MailClient } from "@clawemail/node-sdk";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-// ── mail-cli 子进程封装 ─────────────────────────────────
+// ── mail-cli 子进程封装（仅用于 move/mark） ────────────
 
-// Windows 上 .cmd 文件需要 cmd.exe /c 调用，否则 spawn 会报 EINVAL 或参数解析错
-// spawn("cmd.exe", ["/c", MAIL_CLI, ...args]) 是最可靠的模式
-const MAIL_CLI = "mail-cli.cmd";
-
-// Windows 上 mail-cli/agently-cli 是 .cmd 文件
-// 必须用 shell: true + 完整命令字符串，避免 cmd.exe /c 的二次参数解析问题
 function runMailCli(args, timeout = 15000) {
   return new Promise((resolve, reject) => {
-    // 用空格连接参数，转义参数中的双引号
     const escapedArgs = args.map(a => {
       if (a.includes(' ') || a.includes('"')) {
         return `"${a.replace(/"/g, '\\"')}"`;
@@ -59,48 +52,98 @@ function runMailCli(args, timeout = 15000) {
   });
 }
 
-// ── MailClient 工厂 ────────────────────────────────────
+// ── MailClient 工厂（带连接池，避免重复鉴权） ────────────
+const clientPool = new Map();
+
+function getClient(apiKey, user) {
+  const key = `${apiKey}:${user}`;
+  if (!clientPool.has(key)) {
+    clientPool.set(key, new MailClient({
+      apiKey,
+      user,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    }));
+  }
+  return clientPool.get(key);
+}
 
 function createClient(apiKey, user, logger = null) {
   return new MailClient({
     apiKey,
     user,
-    logger: logger || {
-      info: () => {},
-      warn: () => {},
-      error: () => {},
-    },
+    logger: logger || { info: () => {}, warn: () => {}, error: () => {} },
   });
 }
 
-// ── 列表/搜索（用 mail-cli） ───────────────────────────
+// ── 列表/搜索（用 SDK transport，支持 fid 过滤 + 增量） ──
+
+// 轻量缓存：无过滤条件时 5 秒内命中缓存
+const listCache = new Map();
+const CACHE_TTL_MS = 5000;
 
 export async function listMessages(fid = "1", options = {}) {
-  const { from, subject, keyword, limit = 20, since, before, unread, fts } = options;
-  const args = ["mail", "list", `--fid=${fid}`, `--limit=${limit}`];
-  if (from) args.push(`--from=${from}`);
-  if (subject) args.push(`--subject=${subject}`);
-  if (keyword) args.push(`--keyword=${keyword}`);
-  if (since) args.push(`--since=${since}`);
-  if (before) args.push(`--before=${before}`);
-  if (unread) args.push("--unread");
-  if (fts) args.push("--fts");
+  const { from, subject, keyword, limit = 20, since, before, unread, fts, forceFresh = false } = options;
+  const numLimit = Number(limit) || 20;
 
-  const result = await runMailCli(args);
-  return result.data || [];
+  // 纯列表（无过滤）走缓存
+  const cachedKey = `${fid}:${numLimit}:${unread ? 'U' : ''}`;
+  if (!forceFresh && !from && !subject && !keyword && !before && !fts && !since) {
+    const cached = listCache.get(cachedKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return cached.messages.slice(0, numLimit);
+    }
+  }
+
+  const client = getClient(process.env.CLAWEMAIL_API_KEY, process.env.CLAWEMAIL_ADDRESS);
+
+  const queryParams = { fid, limit: Math.max(numLimit, 50) };
+  if (unread) queryParams.unread = true;
+  if (since) queryParams.since = since;
+  if (before) queryParams.before = before;
+
+  const msgs = await client.transport.listMessages(queryParams);
+
+  // 后过滤
+  let filtered = msgs;
+  if (from) filtered = filtered.filter(m => (m.from || "").toLowerCase().includes(from.toLowerCase()));
+  if (subject) filtered = filtered.filter(m => (m.subject || "").toLowerCase().includes(subject.toLowerCase()));
+  if (keyword) filtered = filtered.filter(m => {
+    const s = (m.subject || "").toLowerCase();
+    const f = (m.from || "").toLowerCase();
+    return s.includes(keyword.toLowerCase()) || f.includes(keyword.toLowerCase());
+  });
+
+  const slice = filtered.slice(0, numLimit);
+
+  // 缓存纯列表结果
+  if (!from && !subject && !keyword && !before && !fts && !since) {
+    listCache.set(cachedKey, { timestamp: Date.now(), messages: slice });
+  }
+
+  return slice;
 }
 
 export async function searchMessages(keyword, options = {}) {
-  const { from, subject, since, before, unread, limit = 20 } = options;
-  const args = ["mail", "search", `--fid=${options.fid || "1"}`, `--keyword=${keyword}`, `--limit=${limit}`];
-  if (from) args.push(`--from=${from}`);
-  if (subject) args.push(`--subject=${subject}`);
-  if (since) args.push(`--since=${since}`);
-  if (before) args.push(`--before=${before}`);
-  if (unread) args.push("--unread");
+  const { from, subject, since, before, unread, limit = 20, fid = "1" } = options;
+  const numLimit = Number(limit) || 20;
 
-  const result = await runMailCli(args);
-  return result.data || [];
+  const client = getClient(process.env.CLAWEMAIL_API_KEY, process.env.CLAWEMAIL_ADDRESS);
+
+  const queryParams = { fid, limit: Math.max(numLimit, 100) };
+  if (unread) queryParams.unread = true;
+  if (since) queryParams.since = since;
+
+  const msgs = await client.transport.listMessages(queryParams);
+
+  const kw = keyword.toLowerCase();
+  return msgs.filter(m => {
+    const s = (m.subject || "").toLowerCase();
+    const f = (m.from || "").toLowerCase();
+    const match = s.includes(kw) || f.includes(kw);
+    if (!match && from) return false;
+    if (!match && subject) return false;
+    return match;
+  }).slice(0, numLimit);
 }
 
 export async function listFolders() {
@@ -193,7 +236,7 @@ export async function replyToMail(apiKey, user, messageId, options) {
   });
 }
 
-// ── 移动/标记（用 mail-cli） ──────────────────────────
+// ── 移动/标记（用 mail-cli，SDK 无对应 API） ──────────
 
 export async function moveMessage(messageId, targetFid) {
   return runMailCli(["move", `--ids=${messageId}`, `--fid=${targetFid}`]);
@@ -217,4 +260,13 @@ export function watch(apiKey, user, onMessage) {
     isConnected: () => client.ws.isConnected(),
     client,
   };
+}
+
+// ── 清理（进程退出时调用） ──────────────────────────────
+
+export function shutdown() {
+  for (const [, client] of clientPool) {
+    try { client.ws.disconnect(); } catch {}
+  }
+  clientPool.clear();
 }
