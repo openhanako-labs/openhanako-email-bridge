@@ -207,4 +207,4 @@ email-monitor/
 
 ## License
 
-MIT
+[GNU AGPL v3](https://www.gnu.org/licenses/agpl-3.0.html)
