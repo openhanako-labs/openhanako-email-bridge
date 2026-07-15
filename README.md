@@ -1,5 +1,9 @@
 # openhanako-email-bridge
 
+
+![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
+
+
 Hanako 邮件监听与管理服务。事件驱动的被动监听 + 助手自治的主动管理。
 
 ## 架构
